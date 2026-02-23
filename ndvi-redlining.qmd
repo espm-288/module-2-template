@@ -1,0 +1,180 @@
+---
+title: "NDVI and Redlining"
+subtitle: "Cloud-native zonal statistics with gdalcubes and mapgl"
+format:
+  html:
+    embed-resources: true
+    code-fold: false
+---
+
+## Setup
+
+```{r}
+#| message: false
+library(rstac)
+library(gdalcubes)
+library(duckdbfs)
+library(mapgl)
+library(sf)
+library(dplyr)
+
+gdalcubes_options(parallel = TRUE)
+```
+
+## 1. Load redlining polygons
+
+Replace `"Oakland"` with your city. Download HOLC GeoJSON from
+<https://dsl.richmond.edu/panorama/redlining/> or use the `redlining` package.
+
+```{r}
+# Option A: read a locally saved GeoJSON
+# holc <- read_sf("data/holc_oakland.geojson")
+
+# Option B: read directly from the Mapping Inequality API
+# (ask the agent to help you find the right URL for your city)
+holc <- read_sf("YOUR_CITY_HOLC.geojson")
+
+bbox <- st_bbox(holc)
+bbox
+```
+
+## 2. Query Sentinel-2 via STAC
+
+```{r}
+items <- stac("https://earth-search.aws.element84.com/v1/") |>
+  stac_search(
+    collections = "sentinel-2-c1-l2a",
+    bbox        = as.numeric(bbox),
+    datetime    = "2023-06-01/2023-08-31",
+    limit       = 200
+  ) |>
+  ext_query("eo:cloud_cover" < 20) |>
+  post_request() |>
+  items_fetch()
+
+cat(length(items$features), "scenes found\n")
+```
+
+## 3. Build NDVI cube
+
+```{r}
+col <- stac_image_collection(
+  items$features,
+  asset_names = c("red", "nir", "scl")
+)
+
+v <- cube_view(
+  srs        = "EPSG:4326",
+  extent     = list(
+    t0 = "2023-06-01", t1 = "2023-08-31",
+    left   = bbox["xmin"], right  = bbox["xmax"],
+    bottom = bbox["ymin"], top    = bbox["ymax"]
+  ),
+  dx = 0.0002, dy = 0.0002,
+  dt = "P1M",
+  aggregation = "median",
+  resampling  = "bilinear"
+)
+
+S2.mask <- image_mask("scl", values = c(3, 8, 9))
+
+ndvi <- raster_cube(col, v, mask = S2.mask) |>
+  select_bands(c("red", "nir")) |>
+  apply_pixel("(nir - red) / (nir + red)", "NDVI") |>
+  reduce_time(c("mean(NDVI)"))
+
+ndvi
+```
+
+## 4. Zonal statistics
+
+```{r}
+zonal     <- ndvi |> extract_geom(holc, FUN = mean, reduce_time = TRUE)
+holc$NDVI <- zonal$NDVI
+
+holc |> st_drop_geometry() |> group_by(holc_grade) |>
+  summarise(mean_NDVI = mean(NDVI, na.rm = TRUE), n = n())
+```
+
+## 5. Choropleth map
+
+```{r}
+maplibre(
+  style  = carto_style("positron"),
+  center = c(mean(bbox[c("xmin","xmax")]), mean(bbox[c("ymin","ymax")])),
+  zoom   = 12
+) |>
+  add_fill_layer(
+    id     = "redlining",
+    source = holc,
+    fill_color = match_expr(
+      column = "holc_grade",
+      values = list("A",       "B",       "C",       "D"),
+      stops  = list("#76a865", "#7cb5bd", "#ffff00", "#d9838d")
+    ),
+    fill_opacity       = 0.65,
+    fill_outline_color = "white"
+  ) |>
+  add_tooltips("redlining", "holc_grade") |>
+  add_legend(
+    "HOLC Grade",
+    values = c("A","B","C","D"),
+    colors = c("#76a865","#7cb5bd","#ffff00","#d9838d"),
+    type   = "categorical"
+  )
+```
+
+## 6. NDVI choropleth
+
+```{r}
+maplibre(
+  style  = carto_style("positron"),
+  center = c(mean(bbox[c("xmin","xmax")]), mean(bbox[c("ymin","ymax")])),
+  zoom   = 12
+) |>
+  add_fill_layer(
+    id     = "ndvi",
+    source = holc,
+    fill_color = interpolate(
+      column = "NDVI",
+      values = c(0, 0.3, 0.6),
+      stops  = c("#d73027", "#ffffbf", "#1a9850")
+    ),
+    fill_opacity = 0.8
+  ) |>
+  add_legend("Mean NDVI (summer 2023)",
+             values = c(0, 0.6),
+             colors = c("#d73027", "#1a9850"))
+```
+
+## 7. 3D extrusion
+
+```{r}
+maplibre(
+  style  = carto_style("dark-matter"),
+  center = c(mean(bbox[c("xmin","xmax")]), mean(bbox[c("ymin","ymax")])),
+  zoom   = 12,
+  pitch  = 50
+) |>
+  add_fill_extrusion_layer(
+    id     = "ndvi-3d",
+    source = holc,
+    fill_extrusion_color = interpolate(
+      column = "NDVI",
+      values = c(0, 0.6),
+      stops  = c("#d73027", "#1a9850")
+    ),
+    fill_extrusion_height = interpolate(
+      column = "NDVI",
+      values = c(0, 0.6),
+      stops  = c(0, 800)
+    ),
+    fill_extrusion_opacity = 0.85
+  )
+```
+
+## Discussion
+
+- Does the NDVI gradient match the pattern in the literature (lower NDVI in D-grade areas)?
+- What is the effect of cloud filtering threshold on your results?
+- What would change if you used a different season?
